@@ -12,11 +12,16 @@ namespace Flowpack\Neos\DimensionResolver\Routing;
  * source code.
  */
 
+use GuzzleHttp\Psr7\Uri;
 use Flowpack\Neos\DimensionResolver\Http;
 use Neos\Flow\Annotations as Flow;
-use Psr\Log\LoggerInterface;
+use Neos\Flow\Persistence\Exception\IllegalObjectTypeException;
+use Neos\Neos\Routing\Exception\InvalidDimensionPresetCombinationException;
+use Neos\Neos\Routing\Exception\InvalidRequestPathException;
+use Neos\Neos\Routing\Exception\NoSuchDimensionValueException;
 use Neos\Flow\Mvc\Routing\Dto\MatchResult;
 use Neos\Flow\Mvc\Routing\Dto\ResolveResult;
+use Neos\Flow\Mvc\Routing\Dto\UriConstraints;
 use Neos\Flow\Mvc\Routing\Dto\RouteTags;
 use Neos\Flow\Mvc\Routing\DynamicRoutePart;
 use Neos\Flow\Security\Context;
@@ -25,19 +30,23 @@ use Neos\Neos\Domain\Repository\SiteRepository;
 use Neos\Neos\Domain\Service\ContentContext;
 use Neos\Neos\Domain\Service\ContentContextFactory;
 use Neos\Neos\Domain\Service\ContentDimensionPresetSourceInterface;
+use Neos\Neos\Domain\Service\NodeShortcutResolver;
 use Neos\Neos\Domain\Service\SiteService;
 use Neos\ContentRepository\Domain\Model\NodeInterface;
 use Neos\ContentRepository\Domain\Utility\NodePaths;
 use Neos\Neos\Routing\FrontendNodeRoutePartHandlerInterface;
 use Neos\Neos\Routing\Exception;
+use Psr\Http\Message\UriInterface;
+use Psr\Log\LoggerInterface;
 
 /**
  * A route part handler for finding nodes specifically in the website's frontend.
  */
 class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendNodeRoutePartHandlerInterface
 {
+
     /**
-     * @Flow\Inject(name="Neos.Flow:SystemLogger")
+     * @Flow\Inject
      * @var LoggerInterface
      */
     protected $systemLogger;
@@ -73,7 +82,7 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
     protected $contentSubgraphUriProcessor;
 
     /**
-     * @Flow\InjectConfiguration("routing.supportEmptySegmentForDimensions")
+     * @Flow\InjectConfiguration("routing.supportEmptySegmentForDimensions", package="Neos.Neos")
      * @var boolean
      */
     protected $supportEmptySegmentForDimensions;
@@ -83,6 +92,12 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
      * @var ContentDimensionPresetSourceInterface
      */
     protected $contentDimensionPresetSource;
+
+    /**
+     * @Flow\Inject
+     * @var NodeShortcutResolver
+     */
+    protected $nodeShortcutResolver;
 
     const DIMENSION_REQUEST_PATH_MATCHER = '|^
         (?<firstUriPart>[^/@]+)                    # the first part of the URI, before the first slash, may contain the encoded dimension preset
@@ -121,7 +136,7 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
      * in time the route part handler is invoked, the security framework is not yet fully initialized.
      *
      * @param string $requestPath The request path (without leading "/", relative to the current Site Node)
-     * @return bool|MatchResult An instance of MatchResult if value could be matched successfully, otherwise false.
+     * @return bool|MatchResult An instance of MatchResult if the route matches the $requestPath, otherwise FALSE. @see DynamicRoutePart::matchValue()
      * @throws \Exception
      * @throws Exception\NoHomepageException if no node could be found on the homepage (empty $requestPath)
      */
@@ -143,6 +158,9 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
                 throw new Exception\NoHomepageException('Homepage could not be loaded. Probably you haven\'t imported a site yet', 1346950755, $exception);
             }
 
+            return false;
+        }
+        if (!$this->nodeTypeIsAllowed($node)) {
             return false;
         }
         if ($this->onlyMatchSiteNodes() && $node !== $node->getContext()->getCurrentSiteNode()) {
@@ -172,11 +190,12 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
      * @throws Exception\NoSiteNodeException
      * @throws Exception\NoSuchNodeException
      * @throws Exception\NoWorkspaceException
-     * @throws \Neos\ContentRepository\Exception\NodeException
+     * @throws IllegalObjectTypeException
+     * @throws InvalidRequestPathException
      */
     protected function convertRequestPathToNode($requestPath)
     {
-        $contentContext = $this->buildContentContextFromParameters();
+        $contentContext = $this->buildContextFromRequestPath($requestPath);
         $requestPathWithoutContext = $this->removeContextFromPath($requestPath);
 
         $workspace = $contentContext->getWorkspace();
@@ -198,7 +217,9 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
         if ($requestPathWithoutContext === '') {
             $node = $siteNode;
         } else {
-            $node = $this->getNodeFromRequestPath($siteNode, $requestPathWithoutContext) ?? null;
+            $requestPathWithoutContext = $this->truncateUriPathSuffix((string)$requestPathWithoutContext);
+            $relativeNodePath = $this->getRelativeNodePathByUriPathSegmentProperties($siteNode, $requestPathWithoutContext);
+            $node = ($relativeNodePath !== false) ? $siteNode->getNode($relativeNodePath) : null;
         }
 
         if (!$node instanceof NodeInterface) {
@@ -220,14 +241,16 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
      * absolute node path: /sites/neostypo3org/homepage/about@user-admin
      * $this->value:       homepage/about@user-admin
      *
-     * @param mixed $node Either a Node object or an absolute context node path
-     * @return ResolveResult|false ResolveResult if value could be resolved successfully, otherwise false.
-     * @throws Exception\MissingNodePropertyException
-     * @throws \Flowpack\Neos\DimensionResolver\Http\Exception\InvalidDimensionPresetLinkProcessorException
-     * @throws \Neos\ContentRepository\Exception\NodeException
+     * @param NodeInterface|string|string[] $node Either a Node object or an absolute context node path (potentially wrapped in an array as ['__contextNodePath' => '<value>'])
+     * @return bool|ResolveResult An instance of ResolveResult if the route coulr resolve the $node, otherwise FALSE. @see DynamicRoutePart::resolveValue()
+     * @throws IllegalObjectTypeException
+     * @see NodeIdentityConverterAspect
      */
     protected function resolveValue($node)
     {
+        if (is_array($node) && isset($node['__contextNodePath'])) {
+            $node = $node['__contextNodePath'];
+        }
         if (!$node instanceof NodeInterface && !is_string($node)) {
             return false;
         }
@@ -248,19 +271,93 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
             $contentContext = $node->getContext();
         }
 
-        if (!$node->getNodeType()->isOfType('Neos.Neos:Document')) {
+        if (!$this->nodeTypeIsAllowed($node)) {
             return false;
         }
-
         $siteNode = $contentContext->getCurrentSiteNode();
         if ($this->onlyMatchSiteNodes() && $node !== $siteNode) {
             return false;
         }
 
-        $routePath = $this->resolveRoutePathForNode($node);
+        try {
+            $nodeOrUri = $this->resolveShortcutNode($node);
+        } catch (Exception\InvalidShortcutException $exception) {
+            $this->systemLogger->debug('FrontendNodeRoutePartHandler resolveValue(): ' . $exception->getMessage());
+            return false;
+        }
+        if ($nodeOrUri instanceof UriInterface) {
+            return new ResolveResult('', UriConstraints::fromUri($nodeOrUri), null);
+        }
         $uriConstraints = $this->contentSubgraphUriProcessor->resolveDimensionUriConstraints($node);
+        if (!empty($this->options['uriPathSuffix']) && $node->getParentPath() !== SiteService::SITES_ROOT_PATH) {
+            $uriConstraints = $uriConstraints->withPathSuffix($this->options['uriPathSuffix']);
+        }
+        $uriPath = $this->resolveRoutePathForNode($nodeOrUri);
+        return new ResolveResult($uriPath, $uriConstraints);
+    }
 
-        return new ResolveResult($routePath, $uriConstraints);
+    /**
+     * Removes the configured suffix from the given $uriPath
+     * If the "uriPathSuffix" option is not set (or set to an empty string) the unaltered $uriPath is returned
+     *
+     * @param string $uriPath
+     * @return false|string|null
+     * @throws Exception\InvalidRequestPathException
+     */
+    protected function truncateUriPathSuffix(string $uriPath)
+    {
+        if (empty($this->options['uriPathSuffix'])) {
+            return $uriPath;
+        }
+        $suffixLength = strlen($this->options['uriPathSuffix']);
+        if (substr($uriPath, -$suffixLength) !== $this->options['uriPathSuffix']) {
+            throw new Exception\InvalidRequestPathException(sprintf('The request path "%s" doesn\'t contain the configured uriPathSuffix "%s"', $uriPath, $this->options['uriPathSuffix']), 1604912439);
+        }
+        return substr($uriPath, 0, -$suffixLength);
+    }
+
+    /**
+     * @param NodeInterface $node
+     * @return NodeInterface|Uri The original, unaltered $node if it's not a shortcut node. Otherwise the nodes shortcut target (a node or an URI for external & asset shortcuts)
+     * @throws Exception\InvalidShortcutException
+     */
+    protected function resolveShortcutNode(NodeInterface $node)
+    {
+        $resolvedNode = $this->nodeShortcutResolver->resolveShortcutTarget($node);
+        if (is_string($resolvedNode)) {
+            return new Uri($resolvedNode);
+        }
+        if (!$resolvedNode instanceof NodeInterface) {
+            throw new Exception\InvalidShortcutException(sprintf('Could not resolve shortcut target for node "%s"', $node->getPath()), 1414771137);
+        }
+        return $resolvedNode;
+    }
+    /**
+     * Creates a content context from the given request path, considering possibly mentioned content dimension values.
+     *
+     * @param string &$requestPath The request path. If at least one content dimension is configured, the first path segment will identify the content dimension values
+     * @return ContentContext The built content context
+     */
+    protected function buildContextFromRequestPath(&$requestPath)
+    {
+        $workspaceName = $this->parameters->getValue('workspaceName') ?? 'live';
+        $dimensionsAndDimensionValues = $this->parameters->getValue('dimensionValues') ? json_decode($this->parameters->getValue('dimensionValues'), true) : [];
+
+        // This is a workaround as NodePaths::explodeContextPath() (correctly)
+        // expects a context path to have something before the '@', but the requestPath
+        // could potentially contain only the context information.
+        if (strpos($requestPath, '@') === 0) {
+            $requestPath = '/' . $requestPath;
+        }
+
+        if ($requestPath !== '' && NodePaths::isContextPath($requestPath)) {
+            try {
+                $nodePathAndContext = NodePaths::explodeContextPath($requestPath);
+                $workspaceName = $nodePathAndContext['workspaceName'];
+            } catch (\InvalidArgumentException $exception) {
+            }
+        }
+        return $this->buildContextFromWorkspaceNameAndDimensions($workspaceName, $dimensionsAndDimensionValues);
     }
 
     /**
@@ -286,7 +383,7 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
 
     /**
      * @param string $workspaceName
-     * @param array $dimensions
+     * @param array|null $dimensions
      * @return ContentContext
      */
     protected function buildContextFromWorkspaceName($workspaceName, array $dimensions = null)
@@ -390,6 +487,18 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
     }
 
     /**
+     * Whether the given $node is allowed according to the "nodeType" option
+     *
+     * @param NodeInterface $node
+     * @return bool
+     */
+    protected function nodeTypeIsAllowed(NodeInterface $node): bool
+    {
+        $allowedNodeType = !empty($this->options['nodeType']) ? $this->options['nodeType'] : 'Neos.Neos:Document';
+        return $node->getNodeType()->isOfType($allowedNodeType);
+    }
+
+    /**
      * Resolves the request path, also known as route path, identifying the given node.
      *
      * A path is built, based on the uri path segment properties of the parents of and the given node itself.
@@ -421,7 +530,6 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
      *
      * @param NodeInterface $siteNode The site node, used as a starting point while traversing the tree
      * @param string $relativeRequestPath The request path, relative to the site's root path
-     * @deprecated Use getNodeFromRequestPath() - return only the node
      * @return string
      * @throws \Neos\ContentRepository\Exception\NodeException
      */
@@ -449,43 +557,11 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
     }
 
     /**
-     * Return Node from RequestPath
-     *
-     * @param NodeInterface $siteNode The site node, used as a starting point while traversing the tree
-     * @param string $relativeRequestPath The request path, relative to the site's root path
-     * @return NodeInterface
-     * @throws \Neos\ContentRepository\Exception\NodeException
-     */
-    protected function getNodeFromRequestPath(NodeInterface $siteNode, $relativeRequestPath)
-    {
-        $matchedNode = false;
-        $node = $siteNode;
-
-        foreach (explode('/', $relativeRequestPath) as $pathSegment) {
-            $foundNodeInThisSegment = false;
-            foreach ($node->getChildNodes('Neos.Neos:Document') as $node) {
-                /** @var NodeInterface $node */
-                if ($node->getProperty('uriPathSegment') === $pathSegment) {
-                    $matchedNode = $node;
-                    $foundNodeInThisSegment = true;
-                    break;
-                }
-            }
-            if (!$foundNodeInThisSegment) {
-                return false;
-            }
-        }
-
-        return $matchedNode;
-    }
-
-    /**
      * Renders a request path based on the "uriPathSegment" properties of the nodes leading to the given node.
      *
      * @param NodeInterface $node The node where the generated path should lead to
      * @return string A relative request path
      * @throws Exception\MissingNodePropertyException if the given node doesn't have a "uriPathSegment" property set
-     * @throws \Neos\ContentRepository\Exception\NodeException
      */
     protected function getRequestPathByNode(NodeInterface $node)
     {
@@ -504,8 +580,7 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
         $requestPathSegments = [];
         while ($currentNode instanceof NodeInterface && $currentNode->getParentPath() !== SiteService::SITES_ROOT_PATH) {
             if (!$currentNode->hasProperty('uriPathSegment')) {
-                throw new Exception\MissingNodePropertyException(sprintf('Missing "uriPathSegment" property for node "%s". Nodes can be migrated with the "flow node:repair" command.',
-                    $node->getPath()), 1415020326);
+                throw new Exception\MissingNodePropertyException(sprintf('Missing "uriPathSegment" property for node "%s". Nodes can be migrated with the "flow node:repair" command.', $node->getPath()), 1415020326);
             }
 
             $pathSegment = $currentNode->getProperty('uriPathSegment');
@@ -513,6 +588,6 @@ class FrontendNodeRoutePartHandler extends DynamicRoutePart implements FrontendN
             $currentNode = $currentNode->getParent();
         }
 
-        return '/' . implode('/', array_reverse($requestPathSegments));
+        return implode('/', array_reverse($requestPathSegments));
     }
 }
